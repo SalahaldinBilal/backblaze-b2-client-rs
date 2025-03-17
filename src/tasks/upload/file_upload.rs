@@ -395,7 +395,6 @@ impl FileUpload {
 
         self.start_timer().await;
 
-        let start = Instant::now();
         let file = self
             .client
             .upload_file(
@@ -405,7 +404,6 @@ impl FileUpload {
                 self.details.optional_info.clone(),
             )
             .await?;
-        println!("create: {:?}", start.elapsed());
 
         Ok(file)
     }
