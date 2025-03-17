@@ -7,6 +7,7 @@ use std::{
 use tokio::{sync::RwLock, task::JoinHandle, time::sleep};
 
 use crate::{
+    error::B2Error,
     simple_client::B2SimpleClient,
     tasks::{
         shared::AsyncFileReader,
@@ -31,16 +32,12 @@ pub struct B2Client {
 }
 
 impl B2Client {
-    pub async fn new(key_id: String, application_key: String) -> Self {
+    pub async fn new(key_id: String, application_key: String) -> Result<Self, B2Error> {
         let key_id: Arc<str> = Arc::from(key_id.into_boxed_str());
         let application_key: Arc<str> = Arc::from(application_key.into_boxed_str());
         let status = WriteLockArc::new(B2ClientStatus::Authed);
 
-        let client = Arc::new(
-            B2SimpleClient::new(&key_id, &application_key)
-                .await
-                .unwrap(),
-        );
+        let client = Arc::new(B2SimpleClient::new(&key_id, &application_key).await?);
 
         let reauth_client = client.clone();
         let status_expire = status.clone();
@@ -81,12 +78,12 @@ impl B2Client {
 
         let uploading_files = Arc::new(RwLock::new(vec![]));
 
-        Self {
+        Ok(Self {
             client,
             reauth_handle,
             uploading_files,
             status,
-        }
+        })
     }
 
     /// Gets current client status
