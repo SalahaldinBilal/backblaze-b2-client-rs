@@ -48,7 +48,7 @@ impl B2Client {
 
             loop {
                 let now = SystemTime::now();
-                let mut epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(85800);
+                let mut epoch = SystemTime::now() + Duration::from_secs(5);
                 let mut expiring = false;
 
                 if let Some(timestamp) = client.auth_data().application_key_expiration_timestamp {
