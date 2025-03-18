@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
+    io::SeekFrom,
     ops::Deref,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
@@ -337,10 +338,10 @@ impl FileUpload {
     async fn upload_small_file(&self) -> Result<B2File, FileUploadError> {
         let mut buffer = Vec::with_capacity(self.details.file_size as usize);
         let mut file = self.file.write().await;
+        file.seek(SeekFrom::Start(0)).await?;
         file.read_to_end(&mut buffer).await?;
         drop(file);
 
-        let file_size = buffer.len() as u64;
         let sha1 = Sha1::from(&buffer).digest().to_string();
 
         let upload_url_response = self
@@ -352,7 +353,7 @@ impl FileUpload {
             .authorization(upload_url_response.authorization_token)
             .file_name(urlencoding::encode(&self.details.file_name).into_owned())
             .content_type("b2/x-auto".into())
-            .content_length(file_size as u32)
+            .content_length(self.details.file_size)
             .content_sha1(sha1)
             .build();
 
@@ -475,7 +476,7 @@ impl FileUpload {
                 let upload_part_headers = B2UploadPartHeaders::builder()
                     .authorization(upload_part_url_response.authorization_token.clone())
                     .part_number(part_number)
-                    .content_length((end - start) as u32)
+                    .content_length(end - start)
                     .content_sha1(sha1.clone())
                     .build();
 

@@ -17,7 +17,7 @@ pub struct B2UploadPartHeaders {
     pub part_number: u16,
     #[serde(rename = "Content-Length")]
     #[builder(!default)]
-    pub content_length: u32,
+    pub content_length: u64,
     #[serde(rename = "X-Bz-Content-Sha1")]
     #[builder(!default)]
     pub content_sha1: String,
@@ -43,7 +43,7 @@ pub struct B2UploadFileHeaders {
     pub content_type: String,
     #[builder(!default)]
     #[serde(rename = "Content-Length")]
-    pub content_length: u32,
+    pub content_length: u64,
     #[builder(!default)]
     #[serde(rename = "X-Bz-Content-Sha1")]
     pub content_sha1: String,
