@@ -48,19 +48,20 @@ impl B2Client {
 
             loop {
                 let now = SystemTime::now();
-                let mut epoch = SystemTime::now() + Duration::from_secs(5);
+                // 10 hours
+                let mut end_time = SystemTime::now() + Duration::from_secs(60 * 60 * 10);
                 let mut expiring = false;
 
                 if let Some(timestamp) = client.auth_data().application_key_expiration_timestamp {
                     let end = SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp);
 
-                    if end < epoch {
+                    if end < end_time {
                         expiring = true;
-                        epoch = end;
+                        end_time = end;
                     }
                 }
 
-                let wait = match epoch.duration_since(now) {
+                let wait = match end_time.duration_since(now) {
                     Ok(dur) => dur,
                     Err(error) => error.duration(),
                 };
