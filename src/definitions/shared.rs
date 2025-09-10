@@ -99,8 +99,11 @@ pub struct B2LifeCycleRules {
     pub file_name_prefix: Box<str>,
 }
 
+// According to b2 docs https://www.backblaze.com/docs/cloud-storage-create-a-cloud-replication-rule-with-the-native-api#check-replication-status
+// these should be lower case unlike what they show in the api
+// wrong api: https://www.backblaze.com/apidocs/b2-get-file-info#:~:text=true%2C%20%22value%22%3A%20null%20%7D-,replicationstatus,-string
 #[derive(Clone, Deserialize, Debug, Serialize)]
-#[serde(rename_all = "UPPERCASE")]
+#[serde(rename_all = "lowercase")]
 pub enum B2ReplicationStatus {
     Pending,
     Completed,
