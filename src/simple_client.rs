@@ -744,9 +744,7 @@ impl B2SimpleClient {
 
         let mut headers = header_map_to_hashmap(response.headers());
         let file_name = headers.remove("x-bz-file-name").expect("should exist");
-        let file_name = urlencoding::decode(&file_name.replace("+", " "))
-            .expect("valid")
-            .to_string();
+        let file_name = utf8_percent_encode(&file_name.replace("+", " "), ENCODE_SET).to_string();
 
         let sha1 = headers.remove("x-bz-content-sha1").expect("should exist");
 
@@ -774,9 +772,8 @@ impl B2SimpleClient {
         for key in keys {
             if key.starts_with("x-bz-info-") {
                 let value = headers.remove(&key).expect("key exists");
-                let value = urlencoding::decode(&value.replace("+", " "))
-                    .expect("valid")
-                    .to_string();
+                let value = utf8_percent_encode(&value.replace("+", " "), ENCODE_SET).to_string();
+
                 temp_file_info.insert(key.replace("x-bz-info-", ""), value);
             }
         }
