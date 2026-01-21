@@ -19,7 +19,7 @@ use super::B2Callback;
 /// let data = response.file.read_all().await;
 /// ```
 pub struct B2FileStream {
-    stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>>>>,
+    stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     size: usize,
     middlewares: Vec<B2Callback<Bytes>>,
 }
@@ -27,7 +27,7 @@ pub struct B2FileStream {
 impl B2FileStream {
     pub fn new<S>(stream: S, size: usize) -> Self
     where
-        S: Stream<Item = Result<Bytes, reqwest::Error>> + 'static,
+        S: Stream<Item = Result<Bytes, reqwest::Error>> + 'static + Send,
     {
         Self {
             stream: Box::pin(stream),
@@ -66,7 +66,7 @@ impl B2FileStream {
         self,
     ) -> (
         usize,
-        Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>>>>,
+        Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     ) {
         (self.size, self.stream)
     }
