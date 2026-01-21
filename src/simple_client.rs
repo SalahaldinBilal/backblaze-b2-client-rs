@@ -37,6 +37,24 @@ use crate::{
     util::{B2FileStream, IntoHeaderMap, WriteLockArc},
 };
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+
+const ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'[')
+    .add(b']')
+    .add(b'{')
+    .add(b'}')
+    .add(b'|')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'%')
+    .add(b'`');
+
 #[derive(Clone, Debug)]
 pub struct B2SimpleClient {
     client: reqwest::Client,
@@ -570,9 +588,17 @@ impl B2SimpleClient {
             .iter()
             .map(|(key, value)| {
                 let key_ref = key.as_ref();
-                (format!("X-Bz-Info-{key_ref}"), value.as_ref())
+                (
+                    format!("X-Bz-Info-{key_ref}"),
+                    utf8_percent_encode(value.as_ref(), ENCODE_SET).to_string(),
+                )
             })
             .collect();
+
+        let mut request_headers = request_headers;
+
+        request_headers.file_name =
+            utf8_percent_encode(&request_headers.file_name, ENCODE_SET).to_string();
 
         let response = self
             .client

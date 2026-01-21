@@ -351,7 +351,7 @@ impl FileUpload {
 
         let b2_upload_headers = B2UploadFileHeaders::builder()
             .authorization(upload_url_response.authorization_token)
-            .file_name(urlencoding::encode(&self.details.file_name).into_owned())
+            .file_name(self.details.file_name.clone())
             .content_type("b2/x-auto".into())
             .content_length(self.details.file_size)
             .content_sha1(sha1)
