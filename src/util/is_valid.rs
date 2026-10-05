@@ -17,7 +17,7 @@ impl Display for InvalidValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Passed {} value is valid, for field {} got [{}] expected [{}].",
+            "Passed {} value is invalid, for field {} got [{}] expected [{}].",
             self.object_name, self.value_name, self.value_as_string, self.expected
         )
     }

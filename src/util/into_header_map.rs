@@ -8,7 +8,7 @@ use crate::error::IntoHeaderMapError;
 pub trait IntoHeaderMap: Sized + Serialize {
     fn into_header_map(self) -> Result<HeaderMap, IntoHeaderMapError> {
         let serialized_object = serde_json::to_value(self)
-            .map_err(|err| IntoHeaderMapError::SerializationFailed(err))?;
+            .map_err(IntoHeaderMapError::SerializationFailed)?;
 
         match serialized_object {
             serde_json::Value::Object(object) => object
@@ -33,7 +33,7 @@ pub trait IntoHeaderMap: Sized + Serialize {
                     Some(Ok((header_name, header_value)))
                 })
                 .collect(),
-            _ => return Err(IntoHeaderMapError::InvalidObject),
+            _ => Err(IntoHeaderMapError::InvalidObject),
         }
     }
 }

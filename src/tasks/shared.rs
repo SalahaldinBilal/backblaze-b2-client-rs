@@ -103,18 +103,23 @@ impl FileNetworkStats {
             percentage: done / self.total,
             done: done.into(),
             total: self.total.into(),
-            elapsed: self.start_time.elapsed(),
+            elapsed: self.start_time.get().elapsed(),
         }
+    }
+
+    pub(super) fn set_done_bytes(&self, bytes: u64) {
+        self.done.store(bytes, Ordering::Relaxed);
     }
 
     pub(super) async fn add_done_bytes(&self, bytes: u64) {
         self.done.fetch_add(bytes, Ordering::Relaxed);
-        let mut buffer = self.speed_buffer.lock_write().await;
+        let mut buffer = self.speed_buffer.lock_write();
         buffer.add_value(bytes);
     }
 
     fn inner_bytes_per_second(&self) -> f64 {
-        let dps = self.speed_buffer.get_valid_points();
+        let buffer = self.speed_buffer.read();
+        let dps = buffer.get_valid_points();
         let mut total = 0.0;
         let oldest_time = dps
             .iter()

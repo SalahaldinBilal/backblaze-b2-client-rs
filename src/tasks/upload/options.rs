@@ -8,10 +8,18 @@ use crate::{
     util::{InvalidValue, IsValid, RetryStrategy, SizeUnit},
 };
 
+/// B2's smallest allowed size for a large file part (every part except the last), in bytes.
+pub const B2_MIN_PART_SIZE: u64 = SizeUnit::MEGABYTE * 5;
+/// B2's largest allowed size for a large file part, and for a file uploaded in one request, in bytes.
+pub const B2_MAX_PART_SIZE: u64 = SizeUnit::GIGABYTE * 5;
+/// B2's maximum number of parts in a large file.
+pub const B2_MAX_PART_COUNT: u64 = 10_000;
+
 /// File upload options
 #[derive(Debug)]
 pub struct FileUploadOptions {
-    /// Cut off point for the file to count as a big file, from 5 Mib - 5 Gib.
+    /// Cut off point for the file to count as a big file, from 5 MB - 5 GB.
+    /// Files above it are uploaded in parts (always at least two, as B2 requires).
     /// <br> Default is 200 Mib.
     pub large_file_cutoff: u64,
     /// The large file load strategy, refer to [ConstantLargeFileLoadStrategy] to find how they work.
@@ -19,12 +27,14 @@ pub struct FileUploadOptions {
     pub file_load_strategy: LargeFileLoadStrategy,
     /// Upload speed throttle, can be used as
     /// ```rust
-    /// // Translates to a MiBPS upload speed limit
+    /// use backblaze_b2_client::{throttle::Throttle, util::SizeUnit};
+    ///
+    /// // Translates to a 5 MiBPS upload speed limit
     /// let throttle = Throttle::per_second(SizeUnit::MEBIBYTE * 5);
     /// ```
     /// <br> Default is None.
     pub speed_throttle: Option<Throttle<u64>>,
-    /// Retry strategy on request failure.
+    /// Retry strategy on request failure. The upload is attempted once plus up to the strategy's retry count.
     /// <br> Defaults to RetryStrategy::Dynamic([crate::util::DefaultRetryStrategy]).
     pub retry_strategy: RetryStrategy,
     /// The extra file upload options B2 provides
@@ -46,14 +56,12 @@ impl Default for FileUploadOptions {
 
 impl IsValid for FileUploadOptions {
     fn is_valid(&self) -> Result<(), InvalidValue> {
-        if self.large_file_cutoff < SizeUnit::MEBIBYTE * 5
-            && self.large_file_cutoff > SizeUnit::GIBIBYTE * 5
-        {
+        if self.large_file_cutoff < B2_MIN_PART_SIZE || self.large_file_cutoff > B2_MAX_PART_SIZE {
             return Err(InvalidValue {
                 object_name: "FileUploadOptions".into(),
                 value_name: "large_file_cutoff".into(),
                 value_as_string: SizeUnit::from(self.large_file_cutoff as f64).to_string(),
-                expected: "5 MiB - 5 GiB".into(),
+                expected: "5 MB - 5 GB".into(),
             });
         }
 
@@ -82,7 +90,8 @@ impl Default for LargeFileLoadStrategy {
 /// the total bytes of the file that would be loaded at once will equal `500 / 3` which is ~166 mibs.
 #[derive(Debug, Clone)]
 pub struct ConstantLargeFileLoadStrategy {
-    /// size of the file part, from 5 Mib - 5 Gib.
+    /// size of the file part, from 5 MB - 5 GB.
+    /// Raised automatically when the file would otherwise need more than B2's 10,000 parts.
     /// <br> Default 5 Mib.
     pub part_size: u64,
     /// How many parts are handled per task. must be at least 1.
@@ -101,12 +110,12 @@ impl IsValid for ConstantLargeFileLoadStrategy {
             });
         }
 
-        if self.part_size < SizeUnit::MEBIBYTE * 5 && self.part_size > SizeUnit::GIBIBYTE * 5 {
+        if self.part_size < B2_MIN_PART_SIZE || self.part_size > B2_MAX_PART_SIZE {
             return Err(InvalidValue {
                 object_name: "ConstantLargeFileLoadStrategy".into(),
                 value_name: "part_size".into(),
                 value_as_string: SizeUnit::from(self.part_size as f64).to_string(),
-                expected: "5 MiB - 5 GiB".into(),
+                expected: "5 MB - 5 GB".into(),
             });
         }
 

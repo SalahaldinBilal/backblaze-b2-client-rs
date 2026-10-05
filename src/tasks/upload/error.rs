@@ -10,6 +10,8 @@ pub enum FileUploadError {
     FailedToReadFile(std::io::Error),
     RequestError(B2Error),
     InvalidOptions(InvalidValue),
+    /// An internal upload task stopped unexpectedly (it panicked).
+    TaskFailed(String),
 }
 
 impl Error for FileUploadError {}
@@ -24,6 +26,7 @@ impl fmt::Display for FileUploadError {
             Self::FailedToReadFile(err) => write!(f, "Failed to read file to upload: {}", err),
             Self::RequestError(err) => write!(f, "{}", err),
             Self::InvalidOptions(err) => write!(f, "{}", err),
+            Self::TaskFailed(err) => write!(f, "Upload task failed: {}", err),
         }
     }
 }

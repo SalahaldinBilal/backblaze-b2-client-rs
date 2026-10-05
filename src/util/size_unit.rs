@@ -12,6 +12,11 @@ impl SizeUnit {
     pub const MEBIBYTE: u64 = 1024 * SizeUnit::KIBIBYTE;
     pub const GIBIBYTE: u64 = 1024 * SizeUnit::MEBIBYTE;
 
+    /// Decimal units, which is what B2 uses for its documented limits.
+    pub const KILOBYTE: u64 = 1000;
+    pub const MEGABYTE: u64 = 1000 * SizeUnit::KILOBYTE;
+    pub const GIGABYTE: u64 = 1000 * SizeUnit::MEGABYTE;
+
     /// Returns current represented value as bytes
     pub fn as_bytes(self) -> f64 {
         match self {

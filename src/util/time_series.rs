@@ -67,7 +67,7 @@ impl<T, const N: usize> RollingTimeSeries<T, N> {
             }
         }
 
-        if let Some(_) = oldest_datapoint {
+        if oldest_datapoint.is_some() {
             *oldest_datapoint = Some(TimeSeriesDataPoint::new(value));
         }
     }

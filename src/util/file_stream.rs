@@ -18,8 +18,11 @@ use super::B2Callback;
 ///
 /// let data = response.file.read_all().await;
 /// ```
+/// The raw byte stream of a B2 download.
+pub type B2ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
 pub struct B2FileStream {
-    stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    stream: B2ByteStream,
     size: usize,
     middlewares: Vec<B2Callback<Bytes>>,
 }
@@ -40,34 +43,24 @@ impl B2FileStream {
     pub async fn read_all(mut self) -> Result<Bytes, B2Error> {
         let mut buffer: Vec<u8> = Vec::with_capacity(self.size);
 
-        loop {
-            match self.stream.next().await {
-                Some(value) => {
-                    let value = value.map_err(|err| B2Error::RequestSendError(err))?;
+        while let Some(value) = self.stream.next().await {
+            let value = value.map_err(B2Error::RequestSendError)?;
 
-                    for middleware in &mut self.middlewares {
-                        match middleware {
-                            B2Callback::Fn(fun) => fun(value.clone()),
-                            B2Callback::AsyncFn(fun) => fun(value.clone()).await,
-                        }
-                    }
-
-                    buffer.extend_from_slice(value.as_ref());
+            for middleware in &mut self.middlewares {
+                match middleware {
+                    B2Callback::Fn(fun) => fun(value.clone()),
+                    B2Callback::AsyncFn(fun) => fun(value.clone()).await,
                 }
-                None => break,
             }
+
+            buffer.extend_from_slice(value.as_ref());
         }
 
         Ok(Bytes::from(buffer))
     }
 
     /// Consumes self, then returns the underlying stream and file size
-    pub fn into_stream(
-        self,
-    ) -> (
-        usize,
-        Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    ) {
+    pub fn into_stream(self) -> (usize, B2ByteStream) {
         (self.size, self.stream)
     }
 

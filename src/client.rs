@@ -69,7 +69,7 @@ impl B2Client {
                 sleep(wait).await;
 
                 if expiring {
-                    status.set(B2ClientStatus::KeyExpired).await;
+                    status.set(B2ClientStatus::KeyExpired);
                     break;
                 }
 
@@ -89,7 +89,7 @@ impl B2Client {
 
     /// Gets current client status
     pub fn status(&self) -> B2ClientStatus {
-        (*self.status).clone()
+        self.status.get()
     }
 
     /// Returns reference to inner basic client
@@ -117,7 +117,7 @@ impl B2Client {
             bucket_id,
             optional_info,
             file_size,
-            options.unwrap_or_else(|| FileUploadOptions::default()),
+            options.unwrap_or_default(),
             self.client.clone(),
         );
 
@@ -130,7 +130,7 @@ impl B2Client {
                 let uploading_files = uploading_files.clone();
 
                 async move {
-                    B2Client::abort_upload_inner(uploading_files, id).await;
+                    B2Client::untrack_upload(uploading_files, id).await;
                 }
             }))
             .await;
@@ -145,9 +145,22 @@ impl B2Client {
         lock_guard.iter().filter_map(|e| e.clone()).collect()
     }
 
-    /// Aborts a specific upload using its ID
+    /// Aborts a specific upload using its ID, see [`FileUpload::abort`], and stops tracking it.
     pub async fn abort_upload(&self, upload_id: u64) {
-        B2Client::abort_upload_inner(self.uploading_files.clone(), upload_id).await;
+        let upload = self
+            .uploading_files
+            .read()
+            .await
+            .iter()
+            .flatten()
+            .find(|upload| upload.id() == upload_id)
+            .cloned();
+
+        if let Some(upload) = upload {
+            upload.abort().await;
+        }
+
+        B2Client::untrack_upload(self.uploading_files.clone(), upload_id).await;
     }
 
     async fn push_upload(&self, upload: Arc<FileUpload>) {
@@ -163,7 +176,7 @@ impl B2Client {
         };
     }
 
-    async fn abort_upload_inner(
+    async fn untrack_upload(
         uploads: Arc<RwLock<Vec<Option<Arc<FileUpload>>>>>,
         upload_id: u64,
     ) {

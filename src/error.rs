@@ -13,6 +13,8 @@ pub enum B2Error {
     RequestSendError(reqwest::Error),
     MissingCapability(B2KeyCapability),
     InvalidHeaders(IntoHeaderMapError),
+    /// B2 answered successfully but the response is missing or has malformed data.
+    InvalidResponse(String),
 }
 
 impl Error for B2Error {}
@@ -29,6 +31,7 @@ impl fmt::Display for B2Error {
                 write!(f, "Client is missing capability: {}", capability)
             }
             Self::InvalidHeaders(err) => write!(f, "Invalid headers passed: {}", err),
+            Self::InvalidResponse(err) => write!(f, "Invalid response: {}", err),
         }
     }
 }

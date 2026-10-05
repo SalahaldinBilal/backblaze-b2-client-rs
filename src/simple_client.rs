@@ -5,7 +5,12 @@ use reqwest::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::json;
-use std::{collections::HashMap, num::NonZeroU16, str::FromStr};
+use std::{
+    collections::HashMap,
+    num::NonZeroU16,
+    str::FromStr,
+    sync::{Arc, RwLock},
+};
 
 use crate::{
     definitions::{
@@ -34,31 +39,39 @@ use crate::{
         },
     },
     error::{B2Error, B2RequestError},
-    util::{B2FileStream, IntoHeaderMap, WriteLockArc},
+    util::{B2FileStream, IntoHeaderMap},
 };
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 
+/// The characters B2 requires to be percent-encoded (non-ASCII bytes are always encoded).
+/// `+` is included because B2 decodes a raw `+` as a space.
+/// See https://www.backblaze.com/docs/cloud-storage-native-api-string-encoding
 const ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
     .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'+')
+    .add(b',')
     .add(b'<')
     .add(b'>')
+    .add(b'?')
     .add(b'[')
-    .add(b']')
-    .add(b'{')
-    .add(b'}')
-    .add(b'|')
     .add(b'\\')
+    .add(b']')
     .add(b'^')
-    .add(b'%')
-    .add(b'`');
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
 
 #[derive(Clone, Debug)]
 pub struct B2SimpleClient {
     client: reqwest::Client,
-    auth_data: WriteLockArc<B2AuthData>,
+    // Re-authorization swaps the whole value, so readers hold their own Arc instead of borrowing it.
+    auth_data: Arc<RwLock<Arc<B2AuthData>>>,
 }
 
 impl B2SimpleClient {
@@ -85,12 +98,21 @@ impl B2SimpleClient {
 
         Ok(B2SimpleClient {
             client,
-            auth_data: WriteLockArc::new(B2SimpleClient::handle_response(auth_response).await?),
+            auth_data: Arc::new(RwLock::new(Arc::new(
+                B2SimpleClient::handle_response(auth_response).await?,
+            ))),
         })
     }
 
     pub fn auth_data(&self) -> B2AuthData {
-        (*self.auth_data).clone()
+        (*self.auth()).clone()
+    }
+
+    fn auth(&self) -> Arc<B2AuthData> {
+        self.auth_data
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub async fn authorize_account<S: AsRef<str>, K: AsRef<str>>(
@@ -114,10 +136,14 @@ impl B2SimpleClient {
             .send()
             .await;
 
-        self.auth_data
-            .set(B2SimpleClient::handle_response(auth_response).await?)
-            .await;
-        Ok(self.auth_data())
+        let auth_data: B2AuthData = B2SimpleClient::handle_response(auth_response).await?;
+
+        *self
+            .auth_data
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(auth_data.clone());
+
+        Ok(auth_data)
     }
 
     /// [b2_cancel_large_file](https://www.backblaze.com/apidocs/b2-cancel-large-file)
@@ -245,8 +271,10 @@ impl B2SimpleClient {
 
     /// [b2_delete_key](https://www.backblaze.com/apidocs/b2-delete-key)
     pub async fn delete_key(&self, application_key_id: String) -> Result<B2AppKey, B2Error> {
+        self.has_capabilities(&[B2KeyCapability::DeleteKeys])?;
+
         let response = self
-            .create_request_with_token(Method::GET, B2Endpoint::B2DeleteKey)
+            .create_request_with_token(Method::POST, B2Endpoint::B2DeleteKey)
             .json(&json!({ "applicationKeyId": application_key_id }))
             .send()
             .await;
@@ -281,7 +309,9 @@ impl B2SimpleClient {
             .client
             .get(format!(
                 "{}/file/{}/{}",
-                self.auth_data.api_info.storage_api.download_url, bucket_name, file_name
+                self.auth().api_info.storage_api.download_url,
+                bucket_name,
+                utf8_percent_encode(&file_name, ENCODE_SET)
             ))
             .header("Authorization", self.get_authorization_token())
             .query(&request_query_params)
@@ -514,6 +544,18 @@ impl B2SimpleClient {
         &self,
         request_body: B2StartLargeFileUploadBody,
     ) -> Result<B2File, B2Error> {
+        let mut needed_capabilities = vec![B2KeyCapability::WriteFiles];
+
+        if request_body.file_retention.is_some() {
+            needed_capabilities.push(B2KeyCapability::WriteFileRetentions);
+        }
+
+        if request_body.legal_hold.is_some() {
+            needed_capabilities.push(B2KeyCapability::WriteFileLegalHolds);
+        }
+
+        self.has_capabilities(&needed_capabilities)?;
+
         let response = self
             .create_request_with_token(Method::POST, B2Endpoint::B2StartLargeFile)
             .json(&request_body)
@@ -579,10 +621,7 @@ impl B2SimpleClient {
         request_headers: B2UploadFileHeaders,
         file_info: Option<HashMap<S, impl AsRef<str>>>,
     ) -> Result<B2File, B2Error> {
-        let file_info = match file_info {
-            Some(map) => map,
-            None => HashMap::new(),
-        };
+        let file_info = file_info.unwrap_or_default();
 
         let file_info: HashMap<_, _> = file_info
             .iter()
@@ -630,12 +669,12 @@ impl B2SimpleClient {
         B2SimpleClient::handle_response(response).await
     }
 
-    pub fn get_authorization_token(&self) -> &str {
-        &self.auth_data.authorization_token
+    pub fn get_authorization_token(&self) -> String {
+        self.auth().authorization_token.clone()
     }
 
     pub fn has_capability(&self, capability: &B2KeyCapability) -> bool {
-        self.auth_data
+        self.auth()
             .api_info
             .storage_api
             .capabilities
@@ -656,8 +695,8 @@ impl B2SimpleClient {
     fn create_request_url(&self, api_name: B2Endpoint) -> String {
         format!(
             "{}/b2api/v3/{}",
-            self.auth_data.api_info.storage_api.api_url,
-            api_name.to_string()
+            self.auth().api_info.storage_api.api_url,
+            api_name
         )
     }
 
@@ -700,10 +739,10 @@ impl B2SimpleClient {
                 Err(_) => B2RequestError {
                     status: NonZeroU16::new(response_code).expect("Response code cannot be 0"),
                     code: String::from(""),
-                    message: Some(String::from(format!(
+                    message: Some(format!(
                         "B2Client failed to parse response as json, returned string: {}",
                         String::from_utf8_lossy(&response)
-                    ))),
+                    )),
                 },
             };
 
@@ -725,7 +764,7 @@ impl B2SimpleClient {
         let text = response
             .text()
             .await
-            .map_err(|err| B2Error::RequestSendError(err))?;
+            .map_err(B2Error::RequestSendError)?;
 
         match serde_json::from_str::<T>(&text) {
             Ok(json) => Ok(json),
@@ -737,48 +776,43 @@ impl B2SimpleClient {
     async fn handle_file_response(
         response: Result<Response, reqwest::Error>,
     ) -> Result<B2DownloadFileContent, B2Error> {
-        let response = match response {
-            Ok(resp) => resp,
-            Err(error) => return Err(B2Error::RequestSendError(error)),
-        };
+        let response = B2SimpleClient::response_option_handling(response).await?;
 
         let mut headers = header_map_to_hashmap(response.headers());
-        let file_name = headers.remove("x-bz-file-name").expect("should exist");
-        let file_name = utf8_percent_encode(&file_name.replace("+", " "), ENCODE_SET).to_string();
+        let file_name = decode_header_value(&take_header(&mut headers, "x-bz-file-name")?);
+        let sha1 = headers.remove("x-bz-content-sha1");
+        let content_length_header = headers.remove("content-length");
 
-        let sha1 = headers.remove("x-bz-content-sha1").expect("should exist");
+        let content_length = match response.content_length() {
+            Some(length) => length,
+            None => parse_header(content_length_header, "content-length")?,
+        };
 
         let mut file_details = B2FileDownloadDetails {
-            file_id: headers.remove("x-bz-file-id").expect("should exist"),
+            file_id: take_header(&mut headers, "x-bz-file-id")?,
             file_name,
-            content_length: headers
-                .remove("content-length")
-                .expect("should exist")
-                .parse()
-                .expect("valid number"),
-            content_type: headers.remove("content-type").expect("should exist"),
-            content_sha1: if sha1 != "none" { Some(sha1) } else { None },
-            upload_timestamp: headers
-                .remove("x-bz-upload-timestamp")
-                .expect("should exist")
-                .parse()
-                .expect("valid number"),
+            content_length,
+            content_type: take_header(&mut headers, "content-type")?,
+            content_sha1: sha1.filter(|sha1| sha1 != "none"),
+            upload_timestamp: parse_header(
+                headers.remove("x-bz-upload-timestamp"),
+                "x-bz-upload-timestamp",
+            )?,
             file_info: None,
         };
 
         let mut temp_file_info: HashMap<String, String> = HashMap::new();
-        let keys: Vec<String> = headers.keys().map(|e| e.clone()).collect();
+        let keys: Vec<String> = headers.keys().cloned().collect();
 
         for key in keys {
-            if key.starts_with("x-bz-info-") {
+            if let Some(info_key) = key.strip_prefix("x-bz-info-") {
                 let value = headers.remove(&key).expect("key exists");
-                let value = utf8_percent_encode(&value.replace("+", " "), ENCODE_SET).to_string();
 
-                temp_file_info.insert(key.replace("x-bz-info-", ""), value);
+                temp_file_info.insert(info_key.to_string(), decode_header_value(&value));
             }
         }
 
-        if temp_file_info.len() > 0 {
+        if !temp_file_info.is_empty() {
             file_details.file_info = Some(temp_file_info)
         }
 
@@ -808,6 +842,28 @@ fn hash_map_to_headers<S: AsRef<str>>(map: HashMap<S, impl AsRef<str>>) -> Heade
         .collect()
 }
 
+/// B2 percent-encodes file names and info values in headers, with `+` standing for a space.
+fn decode_header_value(value: &str) -> String {
+    percent_decode_str(&value.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+fn take_header(headers: &mut HashMap<String, String>, name: &str) -> Result<String, B2Error> {
+    headers
+        .remove(name)
+        .ok_or_else(|| B2Error::InvalidResponse(format!("missing `{name}` header")))
+}
+
+fn parse_header<T: FromStr>(value: Option<String>, name: &str) -> Result<T, B2Error> {
+    let value = value.ok_or_else(|| B2Error::InvalidResponse(format!("missing `{name}` header")))?;
+
+    value
+        .parse()
+        .map_err(|_| B2Error::InvalidResponse(format!("invalid `{name}` header: {value}")))
+}
+
+
 #[inline]
 fn header_map_to_hashmap(map: &HeaderMap) -> HashMap<String, String> {
     let mut header_hashmap = HashMap::new();
@@ -819,4 +875,21 @@ fn header_map_to_hashmap(map: &HeaderMap) -> HashMap<String, String> {
     }
 
     header_hashmap
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_exactly_what_b2_requires() {
+        let encoded = utf8_percent_encode("a b+c&d,e?f#g%h/i!$'()*;=:@~._-é", ENCODE_SET).to_string();
+
+        assert_eq!(encoded, "a%20b%2Bc%26d%2Ce%3Ff%23g%25h/i!$'()*;=:@~._-%C3%A9");
+    }
+
+    #[test]
+    fn decodes_plus_as_space_and_percent_sequences() {
+        assert_eq!(decode_header_value("Frieren+-+01%2B%26.mkv"), "Frieren - 01+&.mkv");
+    }
 }

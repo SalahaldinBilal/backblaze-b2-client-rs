@@ -26,7 +26,10 @@ impl<T: Unsigned + AddAssign + Copy + PartialOrd> Throttle<T> {
 
     /// Equivalent to
     /// ```rust
-    /// Throttle::new(max_per_period, Duration::from_secs(1))
+    /// # use std::time::Duration;
+    /// # use backblaze_b2_client::throttle::Throttle;
+    /// # let max_per_period = 10u64;
+    /// let throttle = Throttle::new(max_per_period, Duration::from_secs(1));
     /// ```
     pub fn per_second(max_per_period: T) -> Self {
         Self::new(max_per_period, Duration::from_secs(1))
@@ -34,7 +37,10 @@ impl<T: Unsigned + AddAssign + Copy + PartialOrd> Throttle<T> {
 
     /// Equivalent to
     /// ```rust
-    /// Throttle::new(max_per_period, Duration::from_secs(60))
+    /// # use std::time::Duration;
+    /// # use backblaze_b2_client::throttle::Throttle;
+    /// # let max_per_period = 10u64;
+    /// let throttle = Throttle::new(max_per_period, Duration::from_secs(60));
     /// ```
     pub fn per_minute(max_per_period: T) -> Self {
         Self::new(max_per_period, Duration::from_secs(60))
@@ -60,11 +66,11 @@ impl<T: Unsigned + AddAssign + Copy + PartialOrd> Throttle<T> {
 
         self.current_count += by;
 
-        return if self.current_count > self.max_per_period {
+        if self.current_count > self.max_per_period {
             T::zero()
         } else {
             self.max_per_period - self.current_count
-        };
+        }
     }
 
     /// If throttle period has been exhausted, waits for the period to end <br>
@@ -85,11 +91,11 @@ impl<T: Unsigned + AddAssign + Copy + PartialOrd> Throttle<T> {
             return self.max_per_period;
         }
 
-        return if self.current_count > self.max_per_period {
+        if self.current_count > self.max_per_period {
             T::zero()
         } else {
             self.max_per_period - self.current_count
-        };
+        }
     }
 }
 
@@ -97,7 +103,7 @@ impl<T: Unsigned + AddAssign + Copy + PartialOrd> Clone for Throttle<T> {
     fn clone(&self) -> Self {
         Self {
             max_per_period: self.max_per_period,
-            period: self.period.clone(),
+            period: self.period,
             count_start: Instant::now(),
             current_count: T::zero(),
         }

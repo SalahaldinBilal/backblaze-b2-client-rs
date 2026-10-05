@@ -23,36 +23,40 @@
 //!
 //! ### File Upload
 //!
-//! ```rust
-//! use backblaze_b2_client::B2Client;
-//! use tokio::fs::File;
+//! ```rust,no_run
+//! use std::time::Duration;
+//!
+//! use backblaze_b2_client::client::B2Client;
+//! use tokio::{fs::File, time::sleep};
 //!
 //! #[tokio::main]
-//! fn main() {
-//!     let client = B2Client::new("your_account_id", "your_application_key");
-//!   
+//! async fn main() {
+//!     let client = B2Client::new("your_key_id".into(), "your_application_key".into())
+//!         .await
+//!         .unwrap();
+//!
 //!     let file = File::open("path_to_file").await.unwrap();
+//!     let metadata = file.metadata().await.unwrap();
 //!
-//!     let metadata = open_file.metadata().await.unwrap();
+//!     let upload = client
+//!         .create_upload(
+//!             file,
+//!             "file_name".into(),
+//!             "bucket_id".into(),
+//!             None,
+//!             metadata.len(),
+//!             None,
+//!         )
+//!         .await;
 //!
-//!     let upload = client.create_upload(
-//!         file,
-//!         "file_name".into(),
-//!         "bucket_id".into(),
-//!         None,
-//!         metadata.len(),
-//!         None,
-//!     ).await;
-//!
-//!     let file_handle_copy = file_handle.clone();
+//!     let progress_upload = upload.clone();
 //!     tokio::spawn(async move {
-//!         let file_handle = file_handle_copy.clone();
 //!         // Logs progress to console every half a second
-//!         while !file_handle.has_stopped() {
+//!         while !progress_upload.has_stopped() {
 //!             println!(
 //!                 "status: {:?}, stats: {:.2}",
-//!                 file_handle.status(),
-//!                 file_handle.stats().current_stats()
+//!                 progress_upload.status(),
+//!                 progress_upload.stats().current_stats()
 //!             );
 //!             sleep(Duration::from_millis(500)).await;
 //!         }

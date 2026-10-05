@@ -76,6 +76,11 @@ pub enum B2KeyCapability {
     ReadBucketNotifications,
     ReadBucketLogging,
     WriteBucketLogging,
+    ReadBucketLifecycleRules,
+    WriteBucketLifecycleRules,
+    /// A capability this crate doesn't know yet. B2 adds new ones over time, and authorizing must not fail on them.
+    #[serde(untagged)]
+    Other(String),
 }
 
 #[derive(Debug, Display, Clone, PartialEq, Serialize, Deserialize)]
@@ -630,4 +635,29 @@ pub struct B2FileDownloadDetails {
     pub content_sha1: Option<String>,
     pub upload_timestamp: u64,
     pub file_info: Option<HashMap<String, String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_key_capabilities_still_deserialize() {
+        let capabilities: Vec<B2KeyCapability> =
+            serde_json::from_str(r#"["writeFiles", "readBucketLifecycleRules", "someFutureCapability"]"#)
+                .expect("capabilities should deserialize");
+
+        assert_eq!(
+            capabilities,
+            vec![
+                B2KeyCapability::WriteFiles,
+                B2KeyCapability::ReadBucketLifecycleRules,
+                B2KeyCapability::Other("someFutureCapability".into()),
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&B2KeyCapability::Other("someFutureCapability".into())).unwrap(),
+            r#""someFutureCapability""#
+        );
+    }
 }

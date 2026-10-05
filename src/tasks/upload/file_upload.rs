@@ -3,7 +3,10 @@ use std::{
     convert::Infallible,
     io::SeekFrom,
     ops::Deref,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -22,8 +25,10 @@ use tokio::{
 
 use crate::{
     definitions::{
-        bodies::{B2FinishLargeFileBody, B2StartLargeFileUploadBody},
+        bodies::{B2DeleteFileVersionBody, B2FinishLargeFileBody, B2StartLargeFileUploadBody},
         headers::{B2UploadFileHeaders, B2UploadPartHeaders},
+        query_params::B2ListPartsQueryParameters,
+        responses::B2FilePart,
         shared::B2File,
     },
     error::B2Error,
@@ -36,9 +41,42 @@ use crate::{
 use crate::tasks::shared::{AsyncFileReader, FileNetworkStats, FileStatus};
 
 use super::{
-    error::FileUploadError, upload_details::UploadFileDetails, FileUploadOptions,
-    LargeFileLoadStrategy,
+    error::FileUploadError, upload_details::UploadFileDetails, ConstantLargeFileLoadStrategy,
+    FileUploadOptions, LargeFileLoadStrategy, B2_MAX_PART_COUNT, B2_MIN_PART_SIZE,
 };
+
+/// B2's maximum `maxPartCount` for a single `b2_list_parts` call.
+const LIST_PARTS_PAGE_SIZE: u16 = 1000;
+/// How many times one part is sent before the whole attempt fails (and resumes on the next retry).
+const MAX_PART_ATTEMPTS: u32 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PlannedPart {
+    /// 1-based, as B2 numbers parts.
+    number: u16,
+    start: u64,
+    end: u64,
+}
+
+impl PlannedPart {
+    fn len(&self) -> u64 {
+        self.end - self.start
+    }
+}
+
+/// What every part upload task of one large file shares.
+#[derive(Clone)]
+struct PartUploadContext {
+    client: Arc<B2SimpleClient>,
+    file_id: String,
+    status: WriteLockArc<FileStatus>,
+    file: Arc<RwLock<dyn AsyncFileReader>>,
+    sha1s: Arc<LargeFileSha1>,
+    total_uploaded: Arc<FileNetworkStats>,
+    upload_throttle: Arc<Option<Mutex<Throttle<u64>>>>,
+    options: Arc<FileUploadOptions>,
+}
+
 pub struct FileUpload {
     id: u64,
     client: Arc<B2SimpleClient>,
@@ -48,7 +86,7 @@ pub struct FileUpload {
     stats: Arc<FileNetworkStats>,
     large_file_id: Arc<RwLock<Option<String>>>,
     completion_callbacks: Arc<RwLock<Vec<B2Callback<()>>>>,
-    abort_channel: (WriteLockArc<Sender<()>>, WriteLockArc<Receiver<()>>),
+    abort_channel: (Sender<()>, Arc<Mutex<Receiver<()>>>),
 }
 
 impl FileUpload {
@@ -78,7 +116,7 @@ impl FileUpload {
             file: Arc::new(RwLock::new(file)),
             stats: Arc::new(FileNetworkStats::new(file_size as f64)),
             completion_callbacks: Arc::new(RwLock::new(vec![])),
-            abort_channel: (WriteLockArc::new(tx), WriteLockArc::new(rx)),
+            abort_channel: (tx, Arc::new(Mutex::new(rx))),
         })
     }
 
@@ -91,62 +129,78 @@ impl FileUpload {
     }
 
     pub fn status(&self) -> FileStatus {
-        (*self.status).clone()
+        self.status.get()
     }
 
     /// Returns true when the file has finished or has been aborted.
     pub fn has_stopped(&self) -> bool {
-        *self.status == FileStatus::Finished || *self.status == FileStatus::Aborted
+        matches!(self.status.get(), FileStatus::Finished | FileStatus::Aborted)
     }
 
-    /// Whether it was started or not, will only start if status is [`Pending`](FileStatus::Pending)
+    /// Moves to `to` only when the current status is one of `from`, under a single lock. Returns whether it moved.
+    fn transition_status(&self, from: &[FileStatus], to: FileStatus) -> bool {
+        let mut status = self.status.lock_write();
+
+        if !from.contains(&*status) {
+            return false;
+        }
+
+        *status = to;
+        true
+    }
+
+    /// Whether it was started or not, will only start if status is [`Pending`](FileStatus::Pending).
+    ///
+    /// Large files that fail are retried on the same unfinished B2 file, re-uploading only the parts B2 doesn't have.
+    /// If the upload fails for good or is aborted, its unfinished large file is cancelled.
     pub async fn start(&self) -> Result<B2File, FileUploadError> {
-        if *self.status != FileStatus::Pending {
+        if !self.transition_status(&[FileStatus::Pending], FileStatus::Working) {
             return Err(FileUploadError::AlreadyStarted);
         }
 
-        self.details.options.is_valid()?;
+        let load_strategy = match &self.details.options.file_load_strategy {
+            LargeFileLoadStrategy::Constant(strat) => strat.clone(),
+            LargeFileLoadStrategy::Dynamic(strat) => strat.get_load_strategy(self.details.file_size),
+        };
 
-        self.status.set(FileStatus::Working).await;
+        let is_large_file = self.details.file_size > self.details.options.large_file_cutoff;
 
-        let retry_count = self.details.options.retry_strategy.count();
-        let mut curr_retry_count = 1;
+        let validation = self.details.options.is_valid().and_then(|_| match is_large_file {
+            true => load_strategy.is_valid(),
+            false => Ok(()),
+        });
+
+        if let Err(error) = validation {
+            // Mark it stopped so progress pollers and the client's tracking don't wait on it forever.
+            self.status.set(FileStatus::Finished);
+            self.call_finish_callbacks().await;
+            return Err(error.into());
+        }
+
+        let max_retries = self.details.options.retry_strategy.count().get();
+        let mut retries: u64 = 0;
         let abort_receiver = self.abort_channel.1.clone();
 
         let result = loop {
-            curr_retry_count += 1;
+            self.transition_status(&[FileStatus::Retrying], FileStatus::Working);
 
-            let result = match self.details.file_size {
-                size if size <= self.details.options.large_file_cutoff => {
-                    self.upload_small_file().await
-                }
-                _ => {
-                    let file_strat = match &self.details.options.file_load_strategy {
-                        LargeFileLoadStrategy::Constant(strat) => strat,
-                        LargeFileLoadStrategy::Dynamic(strat) => {
-                            &strat.get_load_strategy(self.details.file_size)
-                        }
-                    };
-
-                    file_strat.is_valid()?;
-
-                    self.upload_large_file().await
-                }
+            let result = if is_large_file {
+                self.upload_large_file(&load_strategy).await
+            } else {
+                self.upload_small_file().await
             };
 
-            if *self.status == FileStatus::Aborted {
-                break Err(FileUploadError::Aborted);
+            // Keep the real result: a file that completed despite the abort is deleted below.
+            if self.status.get() == FileStatus::Aborted {
+                break result;
             }
 
-            if result.is_err() && curr_retry_count <= retry_count.get() {
-                let wait = self.details.options.retry_strategy.wait(curr_retry_count);
-                let mut receiver_lock = abort_receiver.lock_write().await;
+            if result.is_err() && retries < max_retries {
+                retries += 1;
+                let wait = self.details.options.retry_strategy.wait(retries);
+                let mut receiver_lock = abort_receiver.lock().await;
 
-                let mut status = self.status.lock_write().await;
-                if *status == FileStatus::Working {
-                    *status = FileStatus::Retrying;
-                }
-                drop(status);
+                self.transition_status(&[FileStatus::Working], FileStatus::Retrying);
 
                 tokio::select! {
                     _ = sleep(wait) => {},
@@ -161,32 +215,40 @@ impl FileUpload {
             break result;
         };
 
-        let mut status = self.status.lock_write().await;
-        if *status == FileStatus::Working {
-            *status = FileStatus::Finished;
+        // Covers an abort that landed before the large file's ID was known, and a final failure:
+        // the upload can't be restarted, so its unfinished parts would only be billed storage.
+        if result.is_err() {
+            self.cancel_large_file().await;
         }
-        drop(status);
+
+        let aborted = !self.transition_status(
+            &[FileStatus::Working, FileStatus::Retrying],
+            FileStatus::Finished,
+        );
 
         self.call_finish_callbacks().await;
 
-        if *self.status == FileStatus::Aborted {
+        if aborted {
+            if let Ok(file) = &result {
+                self.delete_uploaded_file(file).await;
+            }
+
             return Err(FileUploadError::Aborted);
         }
 
-        return result;
+        result
     }
 
     /// Will abort ongoing upload if status is [`Working`](FileStatus::Working) or [`Retrying`](FileStatus::Retrying), does nothing otherwise.
+    ///
+    /// In-flight requests stop within one streamed chunk and any unfinished large file is cancelled.
+    /// If the upload still completed on B2 in the meantime, [`start`](Self::start) deletes it and returns [`Aborted`](FileUploadError::Aborted).
     pub async fn abort(&self) {
-        // If its not working there's nothing to do
-        if *self.status != FileStatus::Working || *self.status != FileStatus::Retrying {
+        if !self.transition_status(&[FileStatus::Working, FileStatus::Retrying], FileStatus::Aborted) {
             return;
         }
 
-        self.status.set(FileStatus::Aborted).await;
-
-        let sender = &self.abort_channel.0;
-        sender.send(()).await.ok();
+        self.abort_channel.0.try_send(()).ok();
 
         self.cancel_large_file().await;
     }
@@ -196,103 +258,54 @@ impl FileUpload {
         callbacks.push(callback);
     }
 
-    async fn upload_large_file(&self) -> Result<B2File, FileUploadError> {
+    async fn upload_large_file(
+        &self,
+        file_strat: &ConstantLargeFileLoadStrategy,
+    ) -> Result<B2File, FileUploadError> {
         let file = self.file.clone();
 
-        let start_large_upload_body = B2StartLargeFileUploadBody::builder()
-            .bucket_id(self.details.bucket_id.clone())
-            .file_name(self.details.file_name.clone())
-            .content_type("b2/x-auto".into())
-            .file_info(self.details.optional_info.clone())
-            .build();
+        let parts = plan_parts(self.details.file_size, file_strat.part_size);
+        let (file_id, uploaded_sha1s) = self.prepare_large_file(&parts).await?;
 
-        let start_large_upload_body = self
-            .details
-            .options
-            .options
-            .clone()
-            .apply_large_file_upload(start_large_upload_body);
+        let sha1s = Arc::new(LargeFileSha1::new(parts.len()));
+        let mut already_uploaded: u64 = 0;
 
-        let start_large_file_response = self
-            .client
-            .start_large_file(start_large_upload_body)
-            .await?;
-
-        let file_id = start_large_file_response.file_id;
-        let total_uploaded = self.stats.clone();
-
-        let mut large_file = self.large_file_id.write().await;
-        *large_file = Some(file_id.clone());
-        drop(large_file);
-
-        let file_strat = match &self.details.options.file_load_strategy {
-            LargeFileLoadStrategy::Constant(strat) => strat,
-            LargeFileLoadStrategy::Dynamic(strat) => {
-                &strat.get_load_strategy(self.details.file_size)
-            }
-        };
-
-        let mut parts: Vec<((u64, u64), u16)> = vec![];
-        let mut current_range_start: u16 = 0;
-
-        loop {
-            let start = file_strat.part_size * u64::from(current_range_start);
-            let end = file_strat.part_size * (u64::from(current_range_start) + 1);
-
-            current_range_start += 1;
-
-            if end >= self.details.file_size {
-                parts.push(((start, self.details.file_size), current_range_start));
-                break;
-            } else {
-                parts.push(((start, end), current_range_start));
+        for part in &parts {
+            if let Some(sha1) = uploaded_sha1s.get(&part.number) {
+                sha1s.set_sha1((part.number - 1) as usize, sha1.clone());
+                already_uploaded += part.len();
             }
         }
 
-        let sha1s = Arc::new(LargeFileSha1::new(parts.len()));
+        self.stats.set_done_bytes(already_uploaded);
+
+        let missing_parts: Vec<PlannedPart> = parts
+            .into_iter()
+            .filter(|part| !uploaded_sha1s.contains_key(&part.number))
+            .collect();
+
         let mut join_handles: Vec<JoinHandle<Result<(), FileUploadError>>> = vec![];
         let abort_handles: Arc<RwLock<Vec<AbortHandle>>> = Arc::new(RwLock::new(vec![]));
         self.start_timer().await;
 
-        let upload_throttle = Arc::new(
-            self.details
-                .options
-                .speed_throttle
-                .clone()
-                .map(|t| Mutex::new(t)),
-        );
+        let context = PartUploadContext {
+            client: self.client.clone(),
+            file_id: file_id.clone(),
+            status: self.status.clone(),
+            file,
+            sha1s: sha1s.clone(),
+            total_uploaded: self.stats.clone(),
+            upload_throttle: Arc::new(self.details.options.speed_throttle.clone().map(Mutex::new)),
+            options: self.details.options.clone(),
+        };
 
-        let status = self.status.clone();
-
-        for chunk in parts.chunks(file_strat.chunk_size as usize) {
-            let task_chunk = chunk.to_owned();
-            let file_id = file_id.clone();
-            let sha1s = sha1s.clone();
-            let task_abort_handles = abort_handles.clone();
-            let total_uploaded = total_uploaded.clone();
-            let status = status.clone();
-
-            if *status == FileStatus::Aborted {
+        for chunk in missing_parts.chunks(file_strat.chunk_size as usize) {
+            if self.status.get() == FileStatus::Aborted {
                 break;
             }
 
-            let upload_throttle = upload_throttle.clone();
-            let file = file.clone();
-            let client = self.client.clone();
-
-            let options = self.details.options.clone();
-
-            let task_func = FileUpload::part_upload(
-                client,
-                file_id,
-                status,
-                task_chunk,
-                file,
-                sha1s,
-                total_uploaded,
-                upload_throttle,
-                options,
-            );
+            let task_abort_handles = abort_handles.clone();
+            let task_func = FileUpload::part_upload(context.clone(), chunk.to_owned());
 
             let join_handle = tokio::spawn(async move {
                 let result = task_func.await;
@@ -314,17 +327,22 @@ impl FileUpload {
             abort_handles.write().await.push(abort_handle);
         }
 
+        // Releases its `sha1s` reference so the finished list can be taken out of the Arc below.
+        drop(context);
+
         for handle in join_handles {
             match handle.await {
                 Ok(res) => res,
-                Err(err) => match err.is_cancelled() {
-                    true => continue,
-                    false => panic!("{:#?}", err),
-                },
+                Err(err) if err.is_cancelled() => continue,
+                Err(err) => Err(FileUploadError::TaskFailed(err.to_string())),
             }?;
         }
 
-        Ok(self
+        if self.status.get() == FileStatus::Aborted {
+            return Err(FileUploadError::Aborted);
+        }
+
+        let finished = self
             .client
             .finish_large_file(B2FinishLargeFileBody {
                 file_id: file_id.clone(),
@@ -332,10 +350,92 @@ impl FileUpload {
                     .expect("sha1s shouldn't be referenced any where else")
                     .into(),
             })
-            .await?)
+            .await?;
+
+        *self.large_file_id.write().await = None;
+
+        Ok(finished)
+    }
+
+    /// Reuses the unfinished large file from a previous attempt when B2 still has it, returning the
+    /// SHA1s of the parts that don't need re-uploading. Otherwise starts a new large file.
+    async fn prepare_large_file(
+        &self,
+        parts: &[PlannedPart],
+    ) -> Result<(String, HashMap<u16, String>), FileUploadError> {
+        let previous_file_id = self.large_file_id.read().await.clone();
+
+        if let Some(file_id) = previous_file_id {
+            match self.list_uploaded_parts(&file_id).await {
+                Ok(uploaded) => return Ok((file_id, reusable_part_sha1s(parts, &uploaded))),
+                Err(B2Error::RequestError(error))
+                    if error.status.get() == 400 || error.status.get() == 404 =>
+                {
+                    self.cancel_large_file().await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        if self.status.get() == FileStatus::Aborted {
+            return Err(FileUploadError::Aborted);
+        }
+
+        let start_large_upload_body = B2StartLargeFileUploadBody::builder()
+            .bucket_id(self.details.bucket_id.clone())
+            .file_name(self.details.file_name.clone())
+            .content_type("b2/x-auto".into())
+            .file_info(self.details.optional_info.clone())
+            .build();
+
+        let start_large_upload_body = self
+            .details
+            .options
+            .options
+            .clone()
+            .apply_large_file_upload(start_large_upload_body);
+
+        let start_large_file_response = self
+            .client
+            .start_large_file(start_large_upload_body)
+            .await?;
+
+        let file_id = start_large_file_response.file_id;
+        *self.large_file_id.write().await = Some(file_id.clone());
+
+        Ok((file_id, HashMap::new()))
+    }
+
+    async fn list_uploaded_parts(&self, file_id: &str) -> Result<Vec<B2FilePart>, B2Error> {
+        let mut parts = vec![];
+        let mut start_part_number = None;
+
+        loop {
+            let response = self
+                .client
+                .list_parts(
+                    B2ListPartsQueryParameters::builder()
+                        .file_id(file_id.to_string())
+                        .start_part_number(start_part_number)
+                        .max_part_count(Some(LIST_PARTS_PAGE_SIZE))
+                        .build(),
+                )
+                .await?;
+
+            parts.extend(response.parts);
+
+            match response.next_part_number {
+                Some(next) => start_part_number = Some(next),
+                None => break,
+            }
+        }
+
+        Ok(parts)
     }
 
     async fn upload_small_file(&self) -> Result<B2File, FileUploadError> {
+        self.stats.set_done_bytes(0);
+
         let mut buffer = Vec::with_capacity(self.details.file_size as usize);
         let mut file = self.file.write().await;
         file.seek(SeekFrom::Start(0)).await?;
@@ -384,7 +484,7 @@ impl FileUpload {
                 }
 
 
-                if *status == FileStatus::Aborted {
+                if status.get() == FileStatus::Aborted {
                     break;
                 }
 
@@ -410,15 +510,28 @@ impl FileUpload {
     }
 
     async fn start_timer(&self) {
-        self.stats.start_time.set(Instant::now()).await;
+        self.stats.start_time.set(Instant::now());
     }
 
     async fn cancel_large_file(&self) {
-        let large_file = self.large_file_id.read().await;
+        let large_file_id = self.large_file_id.write().await.take();
 
-        if let Some(id) = large_file.deref() {
-            self.client.cancel_large_file(id.clone()).await.ok();
+        if let Some(id) = large_file_id {
+            self.client.cancel_large_file(id).await.ok();
         }
+    }
+
+    /// Best effort removal of a file that finished uploading after the upload was aborted.
+    async fn delete_uploaded_file(&self, file: &B2File) {
+        self.client
+            .delete_file_version(
+                B2DeleteFileVersionBody::builder()
+                    .file_name(file.file_name.clone())
+                    .file_id(file.file_id.clone())
+                    .build(),
+            )
+            .await
+            .ok();
     }
 
     async fn call_finish_callbacks(&self) {
@@ -433,19 +546,28 @@ impl FileUpload {
     }
 
     async fn part_upload(
-        client: Arc<B2SimpleClient>,
-        file_id: String,
-        status: WriteLockArc<FileStatus>,
-        task_chunk: Vec<((u64, u64), u16)>,
-        file: Arc<RwLock<dyn AsyncFileReader>>,
-        sha1s: Arc<LargeFileSha1>,
-        total_uploaded: Arc<FileNetworkStats>,
-        upload_throttle: Arc<Option<Mutex<Throttle<u64>>>>,
-        options: Arc<FileUploadOptions>,
+        context: PartUploadContext,
+        task_chunk: Vec<PlannedPart>,
     ) -> Result<(), FileUploadError> {
+        let PartUploadContext {
+            client,
+            file_id,
+            status,
+            file,
+            sha1s,
+            total_uploaded,
+            upload_throttle,
+            options,
+        } = context;
+
         let mut upload_part_url_response = client.get_upload_part_url(file_id.clone()).await?;
 
-        for ((start, end), part_number) in task_chunk {
+        for PlannedPart {
+            number: part_number,
+            start,
+            end,
+        } in task_chunk
+        {
             let status = status.clone();
             let mut buffer = vec![0u8; (end - start) as usize];
 
@@ -460,14 +582,16 @@ impl FileUpload {
 
             let buffer = UploadBuffer::new(buffer);
 
-            if *status == FileStatus::Aborted {
+            if status.get() == FileStatus::Aborted {
                 break;
             }
+
+            let mut attempt: u32 = 1;
 
             loop {
                 let status = status.clone();
 
-                if *status == FileStatus::Aborted {
+                if status.get() == FileStatus::Aborted {
                     break;
                 }
 
@@ -487,13 +611,14 @@ impl FileUpload {
 
                 let upload_throttle = upload_throttle.clone();
 
-                let mut total_uploaded_here: u64 = 0;
+                let sent_this_attempt = Arc::new(AtomicU64::new(0));
+                let stream_sent_this_attempt = sent_this_attempt.clone();
                 let total_uploaded_other = total_uploaded.clone();
                 let buffer = buffer.chunks((SizeUnit::KIBIBYTE * 160) as usize);
 
                 let stream = stream! {
                     for chunk in buffer {
-                        if *status == FileStatus::Aborted {
+                        if status.get() == FileStatus::Aborted {
                             break;
                         }
 
@@ -504,7 +629,7 @@ impl FileUpload {
                         }
 
                         total_uploaded.add_done_bytes(chunk.len() as u64).await;
-                        *(&mut total_uploaded_here) += chunk.len() as u64;
+                        stream_sent_this_attempt.fetch_add(chunk.len() as u64, Ordering::Relaxed);
 
                         yield Ok::<_, Infallible>(chunk);
                     }
@@ -523,29 +648,229 @@ impl FileUpload {
 
                 match result {
                     Ok(_) => break,
-                    Err(error) => match error {
-                        B2Error::RequestError(error) => match error.status.get() {
-                            503 => {
-                                upload_part_url_response =
-                                    match client.get_upload_part_url(file_id.clone()).await {
-                                        Ok(resp) => resp,
-                                        Err(err) => return Err(err.into()),
-                                    };
+                    Err(error) if is_retryable_upload_error(&error) && attempt < MAX_PART_ATTEMPTS => {
+                        total_uploaded_other
+                            .done
+                            .fetch_sub(sent_this_attempt.load(Ordering::Relaxed), Ordering::Relaxed);
 
-                                total_uploaded_other
-                                    .done
-                                    .fetch_sub(total_uploaded_here, Ordering::Relaxed);
+                        sleep(Duration::from_secs(1 << (attempt - 1))).await;
+                        attempt += 1;
 
-                                sleep(Duration::from_millis(200)).await;
-                            }
-                            _ => return Err(B2Error::RequestError(error).into()),
-                        },
-                        err => return Err(err.into()),
-                    },
+                        // B2 asks for a fresh upload URL and token after these errors.
+                        upload_part_url_response = client.get_upload_part_url(file_id.clone()).await?;
+                    }
+                    Err(error) => return Err(error.into()),
                 };
             }
         }
 
         Ok(())
+    }
+}
+
+/// Errors after which B2 says to get a new upload URL and try again: connection failures, 401, 408, 429 and any 5xx.
+fn is_retryable_upload_error(error: &B2Error) -> bool {
+    match error {
+        B2Error::RequestSendError(_) => true,
+        B2Error::RequestError(error) => matches!(error.status.get(), 401 | 408 | 429 | 500..=599),
+        _ => false,
+    }
+}
+
+/// Splits the file into parts. B2 needs at least two parts and at most 10,000, so the part size shrinks
+/// for a file no bigger than one part and grows for a file that would need too many.
+/// `file_size` must be larger than [`B2_MIN_PART_SIZE`], which holds for anything above a valid cutoff.
+fn plan_parts(file_size: u64, part_size: u64) -> Vec<PlannedPart> {
+    let part_size = match part_size < file_size {
+        true => part_size,
+        false => B2_MIN_PART_SIZE.max(file_size.div_ceil(2)),
+    };
+    let part_size = part_size.max(file_size.div_ceil(B2_MAX_PART_COUNT));
+    let mut parts = vec![];
+    let mut number: u16 = 0;
+
+    loop {
+        let start = part_size * u64::from(number);
+        let end = part_size * (u64::from(number) + 1);
+
+        number += 1;
+
+        if end >= file_size {
+            parts.push(PlannedPart {
+                number,
+                start,
+                end: file_size,
+            });
+            break;
+        }
+
+        parts.push(PlannedPart { number, start, end });
+    }
+
+    parts
+}
+
+/// Parts already on B2 that match the planned layout, keyed by part number, with B2's SHA1 for each.
+fn reusable_part_sha1s(planned: &[PlannedPart], uploaded: &[B2FilePart]) -> HashMap<u16, String> {
+    uploaded
+        .iter()
+        .filter(|part| {
+            let planned_part = (part.part_number as usize)
+                .checked_sub(1)
+                .and_then(|index| planned.get(index));
+
+            planned_part.is_some_and(|planned_part| planned_part.len() == part.content_length)
+                && part.content_sha1 != "none"
+        })
+        .map(|part| (part.part_number, part.content_sha1.clone()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::definitions::shared::B2ServerSideEncryption;
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn assert_send<T: Send>(_: T) {}
+
+    // Compile-time only: callers spawn these on multi-threaded runtimes, so no lock guard may cross an `.await`.
+    #[allow(dead_code)]
+    fn upload_futures_are_send(upload: &FileUpload) {
+        assert_send(upload.start());
+        assert_send(upload.abort());
+    }
+
+    fn uploaded_part(part_number: u16, content_length: u64, sha1: &str) -> B2FilePart {
+        B2FilePart {
+            file_id: "large-file".into(),
+            part_number,
+            content_length,
+            content_sha1: sha1.into(),
+            content_md5: None,
+            server_side_encryption: B2ServerSideEncryption::Disabled,
+            upload_timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn plan_parts_splits_with_short_last_part() {
+        let parts = plan_parts(12 * MIB, 5 * MIB);
+
+        assert_eq!(
+            parts,
+            vec![
+                PlannedPart { number: 1, start: 0, end: 5 * MIB },
+                PlannedPart { number: 2, start: 5 * MIB, end: 10 * MIB },
+                PlannedPart { number: 3, start: 10 * MIB, end: 12 * MIB },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_parts_exact_multiple_has_no_empty_part() {
+        let parts = plan_parts(10 * MIB, 5 * MIB);
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1], PlannedPart { number: 2, start: 5 * MIB, end: 10 * MIB });
+    }
+
+    #[test]
+    fn plan_parts_always_makes_at_least_two_parts() {
+        let parts = plan_parts(6_000_000, 100 * MIB);
+        assert_eq!(
+            parts,
+            vec![
+                PlannedPart { number: 1, start: 0, end: B2_MIN_PART_SIZE },
+                PlannedPart { number: 2, start: B2_MIN_PART_SIZE, end: 6_000_000 },
+            ]
+        );
+
+        let parts = plan_parts(40 * MIB, 40 * MIB);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].len(), 20 * MIB);
+    }
+
+    #[test]
+    fn plan_parts_stays_within_b2_part_limit() {
+        let file_size = 100 * 1024 * MIB;
+        let parts = plan_parts(file_size, 5 * MIB);
+
+        assert!(parts.len() as u64 <= B2_MAX_PART_COUNT);
+        assert_eq!(parts.last().map(|part| part.end), Some(file_size));
+        assert!(parts.windows(2).all(|pair| pair[0].end == pair[1].start));
+    }
+
+    #[test]
+    fn retryable_upload_errors_follow_b2_guidance() {
+        let request_error = |status: u16| {
+            B2Error::RequestError(crate::error::B2RequestError {
+                status: std::num::NonZeroU16::new(status).unwrap(),
+                code: String::new(),
+                message: None,
+            })
+        };
+
+        for status in [401, 408, 429, 500, 503, 599] {
+            assert!(is_retryable_upload_error(&request_error(status)), "{status} should retry");
+        }
+
+        for status in [400, 403, 404] {
+            assert!(!is_retryable_upload_error(&request_error(status)), "{status} shouldn't retry");
+        }
+    }
+
+    #[test]
+    fn reusable_parts_keeps_matching_parts_only() {
+        let planned = plan_parts(12 * MIB, 5 * MIB);
+        let uploaded = vec![
+            uploaded_part(1, 5 * MIB, "aaa"),
+            // Wrong length: a different part layout, must be re-uploaded.
+            uploaded_part(2, 4 * MIB, "bbb"),
+            uploaded_part(3, 2 * MIB, "ccc"),
+            // Not part of this file's plan.
+            uploaded_part(7, 5 * MIB, "ddd"),
+            uploaded_part(0, 5 * MIB, "eee"),
+        ];
+
+        let reusable = reusable_part_sha1s(&planned, &uploaded);
+
+        assert_eq!(reusable.len(), 2);
+        assert_eq!(reusable.get(&1).map(String::as_str), Some("aaa"));
+        assert_eq!(reusable.get(&3).map(String::as_str), Some("ccc"));
+    }
+
+    #[test]
+    fn reusable_parts_skips_parts_without_sha1() {
+        let planned = plan_parts(12 * MIB, 5 * MIB);
+        let uploaded = vec![uploaded_part(1, 5 * MIB, "none")];
+
+        assert!(reusable_part_sha1s(&planned, &uploaded).is_empty());
+    }
+
+    #[test]
+    fn list_parts_response_parses_b2_shape() {
+        let json = r#"{
+            "nextPartNumber": null,
+            "parts": [
+                {
+                    "fileId": "4_ze73ede9c9c8412db49f60715_f200b4e93fbae6252_d20150824_m224353_c900_v8881000_t0001",
+                    "partNumber": 1,
+                    "contentLength": 100000000,
+                    "contentSha1": "062685a84ab248d2488f02f6b01b948de2514ad8",
+                    "contentMd5": null,
+                    "serverSideEncryption": {"algorithm": "AES256", "mode": "SSE-B2"},
+                    "uploadTimestamp": 1462212184000
+                }
+            ]
+        }"#;
+
+        let response: crate::definitions::responses::B2ListPartsResponse =
+            serde_json::from_str(json).expect("valid list parts response");
+
+        assert_eq!(response.next_part_number, None);
+        assert_eq!(response.parts.len(), 1);
+        assert_eq!(response.parts[0].part_number, 1);
     }
 }

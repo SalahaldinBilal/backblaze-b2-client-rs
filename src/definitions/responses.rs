@@ -168,9 +168,9 @@ pub struct B2ListPartsResponse {
     /// What to pass in to [`startPartNumber`](super::query_params::B2ListPartsQueryParameters::start_part_number)
     /// for the next search to continue where this one left off, or null if there are no more files.
     /// Note this this may not be the number of an actual part, but using it is guaranteed to find the next file in the bucket.
-    pub next_part_number: Vec<u32>,
+    pub next_part_number: Option<u32>,
     /// Array of B2 file parts
-    pub parts: Option<B2FilePart>,
+    pub parts: Vec<B2FilePart>,
 }
 
 #[derive(Clone, Deserialize, Debug)]
