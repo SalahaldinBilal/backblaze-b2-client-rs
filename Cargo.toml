@@ -2,13 +2,14 @@
 name = "backblaze-b2-client"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.84.1"
+rust-version = "1.88"
 license = "MIT"
 description = "Backblaze B2 Client for Rust"
 repository = "https://github.com/SalahaldinBilal/backblaze-b2-client-rs"
 readme = "README.md"
 keywords = ["backblaze", "b2", "api", "client"]
 categories = ["api-bindings"]
+exclude = [".vscode"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
