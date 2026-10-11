@@ -10,6 +10,7 @@ use super::shared::{
     B2MetadataDirective, B2ReplicationConfig, B2ServerSideEncryption,
 };
 
+#[skip_serializing_none]
 #[derive(Clone, Serialize, Debug, TypedBuilder)]
 #[serde(rename_all = "camelCase")]
 #[builder(field_defaults(default))]
@@ -50,6 +51,7 @@ pub struct B2CopyFileBody {
     pub destination_server_side_encryption: Option<B2CustomerAgnosticServerSideEncryption>,
 }
 
+#[skip_serializing_none]
 #[derive(Clone, Serialize, Debug, TypedBuilder)]
 #[serde(rename_all = "camelCase")]
 pub struct B2CopyPartBody {

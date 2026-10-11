@@ -623,6 +623,7 @@ pub struct B2CustomerAgnosticServerSideEncryption {
 #[serde(rename_all = "UPPERCASE")]
 pub enum B2MetadataDirective {
     Copy,
+    Replace,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
